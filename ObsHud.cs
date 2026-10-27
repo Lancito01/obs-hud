@@ -37,6 +37,7 @@ namespace ObsHud
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             if (args.Length == 2 && args[0] == "--preview") { Preview.Render(args[1]); return; }
+            if (args.Length == 2 && args[0] == "--docs") { Preview.Docs(args[1]); return; }
 
             bool first;
             using (var mutex = new Mutex(true, @"Local\ObsHud.SingleInstance", out first))
@@ -1669,6 +1670,98 @@ namespace ObsHud
                     x += 44;
                 }
                 sheet.Save(Path.Combine(dir, "preview.png"), ImageFormat.Png);
+            }
+            foreach (var b in items) b.Dispose();
+        }
+
+        // obs-hud.exe --docs <dir>: the README images, drawn at 2x so they stay sharp on high-DPI screens
+        public static void Docs(string dir)
+        {
+            const float s = 2f;
+            Directory.CreateDirectory(dir);
+            var red = new KeyValuePair<Color, string>(Gfx.Red, "REC 12:34");
+            var teal = new KeyValuePair<Color, string>(Gfx.Teal, "REPLAY");
+
+            // hero: the top-right corner of a screen mid-game, pill and toast where the app puts them
+            using (var pill = Gfx.Pill(new[] { red, teal }, s))
+            using (var toast = Gfx.Toast(Glyph.Check, Gfx.Green, "Clip saved", "#3 · Replay 2026-10-27 21-04-11.mp4 · 62 MB", "Gameplay", s))
+            using (var hero = new Bitmap(1600, 420, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(hero))
+            {
+                using (var bg = new LinearGradientBrush(new Rectangle(0, 0, hero.Width, hero.Height), Color.FromArgb(18, 24, 48), Color.FromArgb(58, 34, 78), 25f))
+                    g.FillRectangle(bg, 0, 0, hero.Width, hero.Height);   // before anti-aliasing, which would leave the edge pixels half transparent
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                Glow(g, new RectangleF(-260, 160, 900, 620), Color.FromArgb(150, 32, 190, 172));
+                Glow(g, new RectangleF(720, -340, 1100, 760), Color.FromArgb(120, 240, 120, 70));
+                Glow(g, new RectangleF(380, 300, 760, 480), Color.FromArgb(90, 110, 90, 240));
+                int m = (int)(18 * s);
+                g.DrawImage(pill, hero.Width - m - pill.Width, m, pill.Width, pill.Height);
+                g.DrawImage(toast, hero.Width - m - toast.Width, m + pill.Height + (int)(8 * s), toast.Width, toast.Height);
+                hero.Save(Path.Combine(dir, "hero.png"), ImageFormat.Png);
+            }
+
+            // every pill state, side by side on a transparent background
+            var pills = new List<Bitmap>
+            {
+                Gfx.Pill(new[] { red, teal }, s),
+                Gfx.Pill(new[] { new KeyValuePair<Color, string>(Gfx.Amber, "PAUSED 3:07") }, s),
+                Gfx.Pill(new[] { teal }, s),
+            };
+            Sheet(pills, pills.Count, 24, Path.Combine(dir, "pills.png"));
+
+            // the notifications, two columns on a transparent background
+            var toasts = new List<Bitmap>
+            {
+                Gfx.Toast(Glyph.Rec, Gfx.Red, "Recording started", "Replay buffer is on too", "Gameplay", s),
+                Gfx.Toast(Glyph.Check, Gfx.Green, "Clip saved", "#3 · Replay 21-04-11.mp4 · 62 MB", "Gameplay", s),
+                Gfx.Toast(Glyph.Pause, Gfx.Amber, "Recording paused", "at 3:07", "Gameplay", s),
+                Gfx.Toast(Glyph.Check, Gfx.Green, "Recording saved", "12:34 · 21-04-15.mp4 · 1.4 GB", "Gameplay", s),
+                Gfx.Toast(Glyph.Replay, Gfx.Teal, "Replay buffer on", "Clips save the last 50 s", null, s),
+                Gfx.Toast(Glyph.Warn, Gfx.Amber, "Lost connection to OBS", "It was still recording or buffering", null, s),
+            };
+            Sheet(toasts, 2, 20, Path.Combine(dir, "notifications.png"));
+        }
+
+        static void Glow(Graphics g, RectangleF r, Color c)
+        {
+            using (var path = new GraphicsPath())
+            {
+                path.AddEllipse(r);
+                using (var b = new PathGradientBrush(path) { CenterColor = c, SurroundColors = new[] { Color.FromArgb(0, c) } })
+                    g.FillPath(b, path);
+            }
+        }
+
+        // Lays bitmaps out in a grid (each column as wide as its widest item), saves it and disposes them.
+        static void Sheet(List<Bitmap> items, int cols, int gap, string file)
+        {
+            int rows = (items.Count + cols - 1) / cols;
+            var colW = new int[cols];
+            var rowH = new int[rows];
+            for (int i = 0; i < items.Count; i++)
+            {
+                colW[i % cols] = Math.Max(colW[i % cols], items[i].Width);
+                rowH[i / cols] = Math.Max(rowH[i / cols], items[i].Height);
+            }
+            int W = gap * (cols - 1), H = gap * (rows - 1);
+            foreach (int w in colW) W += w;
+            foreach (int h in rowH) H += h;
+            using (var sheet = new Bitmap(W, H, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(sheet))
+            {
+                int y = 0;
+                for (int r = 0; r < rows; r++)
+                {
+                    int x = 0;
+                    for (int c = 0; c < cols && r * cols + c < items.Count; c++)
+                    {
+                        var b = items[r * cols + c];
+                        g.DrawImage(b, x, y + (rowH[r] - b.Height) / 2, b.Width, b.Height);
+                        x += colW[c] + gap;
+                    }
+                    y += rowH[r] + gap;
+                }
+                sheet.Save(file, ImageFormat.Png);
             }
             foreach (var b in items) b.Dispose();
         }
