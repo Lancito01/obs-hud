@@ -1,0 +1,8 @@
+# Built output (shipped through GitHub Releases instead)
+*.exe
+*.pdb
+
+# Per-user files the app creates next to the exe
+obs-hud.ini
+obs-hud.log
+sounds/
