@@ -14,7 +14,9 @@ using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -24,6 +26,10 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Timer = System.Windows.Forms.Timer;
+
+// Releases are tagged v + this version (v1.1), which the updater compares against.
+[assembly: AssemblyVersion("1.1")]
+[assembly: AssemblyFileVersion("1.1")]
 
 namespace ObsHud
 {
@@ -42,11 +48,18 @@ namespace ObsHud
             bool first;
             using (var mutex = new Mutex(true, @"Local\ObsHud.SingleInstance", out first))
             {
-                if (!first) return;
+                // After an update the old instance starts this one and exits, so wait for it to let go
+                if (!first && !(args.Length > 0 && args[0] == "--restart" && Acquire(mutex))) return;
                 Application.ThreadException += (s, e) => Log.Write("error: " + e.Exception);
                 SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
                 Application.Run(new HudApp(args.Length > 0 && args[0] == "--demo"));
             }
+        }
+
+        static bool Acquire(Mutex mutex)
+        {
+            try { return mutex.WaitOne(10000); }
+            catch (AbandonedMutexException) { return true; }   // the old instance exited without releasing it, which still hands it over
         }
     }
 
@@ -60,6 +73,8 @@ namespace ObsHud
         public string PeekHotkey = "Alt+F16";
         public double Scale = 1.0;
         public bool HideFromCapture = true;
+        public bool Rtss = false;
+        public bool AutoUpdate = true;
         public bool Sounds = true;
         public int Volume = 70;
         public string Device = "";
@@ -92,6 +107,8 @@ namespace ObsHud
                     case "peekhotkey": c.PeekHotkey = v; break;
                     case "scale": c.Scale = Math.Max(0.5, Math.Min(3, Num(v, c.Scale))); break;
                     case "hidefromcapture": c.HideFromCapture = Bool(v, c.HideFromCapture); break;
+                    case "rtss": c.Rtss = Bool(v, c.Rtss); break;
+                    case "autoupdate": c.AutoUpdate = Bool(v, c.AutoUpdate); break;
                     case "sounds": c.Sounds = Bool(v, c.Sounds); break;
                     case "volume": c.Volume = (int)Math.Max(0, Math.Min(100, Num(v, c.Volume))); break;
                     case "device": c.Device = v; break;
@@ -121,6 +138,12 @@ namespace ObsHud
                 "Scale=" + Scale.ToString(ic),
                 "; 1 = keep the HUD out of OBS display captures and screenshots",
                 "HideFromCapture=" + (HideFromCapture ? 1 : 0),
+                "; 1 = in exclusive fullscreen games, where no window can show, have RivaTuner Statistics Server",
+                "; draw the HUD instead (needs RTSS running). It hides along with the rest of the RTSS overlay.",
+                "; RTSS draws it into the game's frames, so display captures record it.",
+                "Rtss=" + (Rtss ? 1 : 0),
+                "; 1 = download new versions from GitHub on their own; the HUD asks you to restart to use one",
+                "AutoUpdate=" + (AutoUpdate ? 1 : 0),
                 "",
                 "[Sound]",
                 "Sounds=" + (Sounds ? 1 : 0),
@@ -841,6 +864,8 @@ namespace ObsHud
         public const int SW_HIDE = 0, SW_SHOWNOACTIVATE = 4, WM_HOTKEY = 0x312, ULW_ALPHA = 2, GWL_EXSTYLE = -20;
         public const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOACTIVATE = 0x10;
         public const uint WDA_NONE = 0, WDA_EXCLUDEFROMCAPTURE = 0x11;
+        public const uint FILE_MAP_WRITE = 0x2, FILE_MAP_READ = 0x4;
+        public const int QUNS_RUNNING_D3D_FULL_SCREEN = 3;
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
 
         [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; public POINT(int x, int y) { X = x; Y = y; } }
@@ -853,6 +878,7 @@ namespace ObsHud
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hwnd, out int pid);
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
         [DllImport("user32.dll")] public static extern IntPtr GetShellWindow();
         [DllImport("user32.dll")] public static extern IntPtr GetDesktopWindow();
@@ -863,6 +889,11 @@ namespace ObsHud
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hwnd, int id, uint mods, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hwnd, int id);
         [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr icon);
+        [DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr OpenFileMapping(uint access, bool inherit, string name);
+        [DllImport("kernel32.dll")] public static extern IntPtr MapViewOfFile(IntPtr map, uint access, uint offsetHigh, uint offsetLow, UIntPtr bytes);
+        [DllImport("kernel32.dll")] public static extern bool UnmapViewOfFile(IntPtr view);
+        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
         [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
         [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr hdc);
         [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
@@ -984,6 +1015,8 @@ namespace ObsHud
         int phaseStart, holdMs;
         Point pos;
 
+        public event Action Hidden;
+
         public Toasts(Overlay win)
         {
             this.win = win;
@@ -1023,7 +1056,7 @@ namespace ObsHud
                     if (t >= holdMs) Enter(Phase.Out);
                     break;
                 case Phase.Out:
-                    if (t >= FadeOutMs) { timer.Stop(); phase = Phase.Hidden; win.Conceal(); }
+                    if (t >= FadeOutMs) { timer.Stop(); phase = Phase.Hidden; win.Conceal(); if (Hidden != null) Hidden(); }
                     else win.Present(pos, (byte)(255 - 255 * t / FadeOutMs));
                     break;
             }
@@ -1081,6 +1114,230 @@ namespace ObsHud
         }
     }
 
+    // ---------------------------------------------------------------- RTSS on-screen display
+
+    // Feeds RivaTuner Statistics Server's on-screen display, which RTSS draws inside the game's own
+    // frames, so it shows even in exclusive fullscreen. This app injects nothing: like HWiNFO and
+    // AIDA64, it only fills one of the text slots in RTSS's shared memory, following
+    // SDK\Include\RTSSSharedMemory.h and the SDK's RTSSSharedMemorySample.
+    class RtssOsd
+    {
+        const string Owner = "OBS HUD";
+        const int Signature = 0x52545353;   // 'RTSS'
+        const int MinVersion = 0x0002000E;  // v2.14: text tags and the busy lock
+        // Header fields, offsets inside an OSD slot, and inside an app entry
+        const int AppEntrySize = 8, AppArrOffset = 12, AppArrSize = 16;
+        const int OsdEntrySize = 20, OsdArrOffset = 24, OsdArrSize = 28, OsdFrame = 32, Busy = 36;
+        const int OwnerAt = 256, TextAt = 512, TextSize = 4096;
+        const int OsdPixelAt = 324, ResolutionAt = 9224;   // ResolutionAt needs v2.20
+        bool claimed = true;   // so the first Clear also frees a slot left behind if the app crashed
+
+        // How RTSS draws in the given process: its OSD zoom. False if RTSS isn't running or isn't drawing in it.
+        public bool Target(int pid, out int zoom)
+        {
+            int z = 0;
+            bool found = Use(false, mem =>
+            {
+                if (Marshal.ReadInt32(mem, 4) < 0x00020014) return false;
+                int size = Marshal.ReadInt32(mem, AppEntrySize), offset = Marshal.ReadInt32(mem, AppArrOffset), count = Marshal.ReadInt32(mem, AppArrSize);
+                for (int i = 0; i < count; i++)
+                {
+                    IntPtr app = mem + offset + i * size;
+                    if (Marshal.ReadInt32(app) != pid) continue;
+                    z = Math.Max(1, Marshal.ReadInt32(app, OsdPixelAt));
+                    return Marshal.ReadInt32(app, ResolutionAt) > 0;   // RTSS has seen it render a frame
+                }
+                return false;
+            });
+            zoom = z;
+            return found;
+        }
+
+        // Shows text in our slot, claiming a free one first. False if RTSS isn't running or every slot is taken.
+        public bool Show(string text)
+        {
+            return Use(false, mem =>
+            {
+                IntPtr slot = Slot(mem, true);
+                if (slot == IntPtr.Zero) return false;
+                claimed = true;
+                byte[] bytes = Encoding.Default.GetBytes(text);   // RTSS reads ANSI text
+                int n = Math.Min(bytes.Length, TextSize - 1);
+                if (Marshal.PtrToStringAnsi(slot + TextAt) == Encoding.Default.GetString(bytes, 0, n)) return true;
+                if (!Lock(mem)) return false;
+                try
+                {
+                    Marshal.Copy(bytes, 0, slot + TextAt, n);
+                    Marshal.WriteByte(slot + TextAt, n, 0);
+                }
+                finally { Unlock(mem); }
+                Redraw(mem);
+                return true;
+            });
+        }
+
+        // Frees our slot so RTSS stops drawing it.
+        public void Clear()
+        {
+            if (!claimed) return;
+            claimed = false;
+            Use(true, mem =>
+            {
+                IntPtr slot = Slot(mem, false);
+                if (slot == IntPtr.Zero) return true;
+                Marshal.Copy(new byte[TextAt + TextSize], 0, slot, TextAt + TextSize);   // owner and text; we never touch the rest
+                Redraw(mem);
+                return true;
+            });
+        }
+
+        static T Use<T>(T fallback, Func<IntPtr, T> action)
+        {
+            IntPtr map = Native.OpenFileMapping(Native.FILE_MAP_READ | Native.FILE_MAP_WRITE, false, "RTSSSharedMemoryV2");
+            if (map == IntPtr.Zero) return fallback;
+            IntPtr mem = Native.MapViewOfFile(map, Native.FILE_MAP_WRITE, 0, 0, UIntPtr.Zero);
+            try
+            {
+                if (mem == IntPtr.Zero || Marshal.ReadInt32(mem) != Signature) return fallback;
+                int version = Marshal.ReadInt32(mem, 4);
+                return version >= MinVersion && version >> 16 == 2 ? action(mem) : fallback;
+            }
+            finally
+            {
+                if (mem != IntPtr.Zero) Native.UnmapViewOfFile(mem);
+                Native.CloseHandle(map);
+            }
+        }
+
+        // Our slot, or with claim the first free one. Slot 0 is reserved for Afterburner, as the SDK asks.
+        static IntPtr Slot(IntPtr mem, bool claim)
+        {
+            int size = Marshal.ReadInt32(mem, OsdEntrySize), offset = Marshal.ReadInt32(mem, OsdArrOffset), count = Marshal.ReadInt32(mem, OsdArrSize);
+            IntPtr free = IntPtr.Zero;
+            for (int i = 1; i < count; i++)
+            {
+                IntPtr slot = mem + offset + i * size;
+                string owner = Marshal.PtrToStringAnsi(slot + OwnerAt);
+                if (owner == Owner) return slot;
+                if (owner.Length == 0 && free == IntPtr.Zero) free = slot;
+            }
+            if (!claim || free == IntPtr.Zero) return IntPtr.Zero;
+            byte[] name = Encoding.ASCII.GetBytes(Owner + "\0");
+            Marshal.Copy(name, 0, free + OwnerAt, name.Length);
+            return free;
+        }
+
+        // Bit 0 of the busy field is a lock shared with RTSS's renderer, which only holds it while copying text.
+        static unsafe bool Lock(IntPtr mem)
+        {
+            int* busy = (int*)(mem + Busy).ToPointer();
+            var spin = new SpinWait();
+            while (true)
+            {
+                int old = Thread.VolatileRead(ref *busy);
+                if ((old & 1) == 0 && Interlocked.CompareExchange(ref *busy, old | 1, old) == old) return true;
+                if (spin.Count >= 100) return false;
+                spin.SpinOnce();
+            }
+        }
+
+        static unsafe void Unlock(IntPtr mem)
+        {
+            Interlocked.Exchange(ref *(int*)(mem + Busy).ToPointer(), 0);
+        }
+
+        static void Redraw(IntPtr mem)
+        {
+            Marshal.WriteInt32(mem, OsdFrame, Marshal.ReadInt32(mem, OsdFrame) + 1);
+        }
+    }
+
+    // ---------------------------------------------------------------- updates
+
+    // Finds the latest GitHub release and puts its obs-hud.exe in place of this one. Windows lets a
+    // running exe be renamed but not overwritten, so this one moves aside to obs-hud.exe.old (deleted
+    // on the next start) and the download takes its name. It runs from the next start.
+    static class Updater
+    {
+        const string Repo = "Lancito01/obs-hud", Asset = "obs-hud.exe";
+
+        public class Release { public Version Version; public string Tag, Url, Sha256; }
+
+        public static Version Current { get { return Assembly.GetExecutingAssembly().GetName().Version; } }
+
+        // The latest release if it's newer than this build, else null.
+        public static async Task<Release> Newer()
+        {
+            string json;
+            using (var web = Client())
+            {
+                web.Headers[HttpRequestHeader.Accept] = "application/vnd.github+json";
+                json = await web.DownloadStringTaskAsync("https://api.github.com/repos/" + Repo + "/releases/latest");
+            }
+            var r = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+            string tag = J.Str(r, "tag_name");
+            Version v;
+            if (tag == null || !Version.TryParse(tag.TrimStart('v', 'V'), out v) || Normalize(v) <= Normalize(Current)) return null;
+            object assets;
+            r.TryGetValue("assets", out assets);
+            foreach (var o in assets as System.Collections.IEnumerable ?? new object[0])
+            {
+                var a = o as Dictionary<string, object>;
+                if (J.Str(a, "name") != Asset) continue;
+                string digest = J.Str(a, "digest");
+                return new Release
+                {
+                    Version = v, Tag = tag, Url = J.Str(a, "browser_download_url"),
+                    Sha256 = digest != null && digest.StartsWith("sha256:") ? digest.Substring(7) : null,
+                };
+            }
+            return null;
+        }
+
+        // Downloads the release and swaps it in for exe. Throws if the download doesn't match GitHub's
+        // checksum or the exe's folder can't be written to.
+        public static async Task Install(Release r, string exe)
+        {
+            string fresh = exe + ".new", old = exe + ".old";
+            try
+            {
+                using (var web = Client()) await web.DownloadFileTaskAsync(r.Url, fresh);
+                byte[] bytes = File.ReadAllBytes(fresh);
+                if (bytes.Length < 2 || bytes[0] != 'M' || bytes[1] != 'Z') throw new InvalidDataException("the download isn't a program");
+                if (r.Sha256 != null)
+                    using (var sha = SHA256.Create())
+                        if (!string.Equals(BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", ""), r.Sha256, StringComparison.OrdinalIgnoreCase))
+                            throw new InvalidDataException("the download doesn't match its checksum");
+                if (File.Exists(old)) File.Delete(old);
+                File.Move(exe, old);
+                try { File.Move(fresh, exe); }
+                catch { File.Move(old, exe); throw; }
+            }
+            finally { TryDelete(fresh); }
+        }
+
+        // Deletes the exe the last update moved aside, now that it isn't running.
+        public static void CleanUp() { TryDelete(Application.ExecutablePath + ".old"); }
+
+        static void TryDelete(string path)
+        {
+            try { File.Delete(path); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        // Treats 1.1 and 1.1.0.0 as the same version.
+        static Version Normalize(Version v) { return new Version(v.Major, v.Minor, Math.Max(0, v.Build), Math.Max(0, v.Revision)); }
+
+        static WebClient Client()
+        {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;   // GitHub requires TLS 1.2
+            var web = new WebClient();
+            web.Headers[HttpRequestHeader.UserAgent] = "obs-hud/" + Current;
+            return web;
+        }
+    }
+
     // ---------------------------------------------------------------- the app
 
     class HudApp : ApplicationContext
@@ -1092,11 +1349,15 @@ namespace ObsHud
         readonly ObsClient obs;
         readonly Overlay toastWin = new Overlay(), pillWin = new Overlay();
         readonly Toasts toasts;
+        readonly RtssOsd rtss = new RtssOsd();
         readonly NotifyIcon tray = new NotifyIcon();
         readonly Sounds sounds = new Sounds();
         readonly HotkeyWindow hotkey;
         readonly Timer pillTimer = new Timer { Interval = 1000 };
         readonly Timer reloadTimer = new Timer { Interval = 400 };
+        readonly Timer updateTimer = new Timer();
+        Updater.Release updateReady;   // installed, runs after a restart
+        bool checkingUpdates;
         readonly FileSystemWatcher watcher;
         int ignoreConfigUntil;
 
@@ -1108,9 +1369,13 @@ namespace ObsHud
         string scene, lastSaved, status = "Waiting for OBS to start";
 
         string pillKey;
-        Point pillPos;
-        List<KeyValuePair<Color, string>> demoPill;
+        Point pillPos, toastPos;
+        const byte PillAlpha = 240;
+        List<KeyValuePair<Color, string>> demoPill, pillShown;   // pillShown is null while the pill is hidden
         bool demoRunning;
+        Func<Bitmap> rtssToast;   // draws the toast on screen again, for RTSS
+        int toastSerial, rtssImageSerial;
+        string rtssKey, rtssText, rtssState;
 
         public HudApp(bool demo)
         {
@@ -1121,6 +1386,7 @@ namespace ObsHud
             toastWin.HideFromCapture(cfg.HideFromCapture);
             pillWin.HideFromCapture(cfg.HideFromCapture);
             toasts = new Toasts(toastWin);
+            toasts.Hidden += delegate { rtssToast = null; UpdateRtss(); };
             sounds.Load(cfg);
 
             tray.ContextMenuStrip = new ContextMenuStrip();
@@ -1135,6 +1401,9 @@ namespace ObsHud
 
             pillTimer.Tick += delegate { RefreshPill(); };
             reloadTimer.Tick += delegate { reloadTimer.Stop(); Reload(); };
+            updateTimer.Tick += delegate { updateTimer.Interval = 12 * 3600 * 1000; CheckForUpdates(false); };
+            Updater.CleanUp();
+            ScheduleUpdates();
             watcher = new FileSystemWatcher(Config.Dir, "obs-hud.ini") { SynchronizingObject = toastWin, NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName };
             FileSystemEventHandler onChange = delegate { if (Environment.TickCount - ignoreConfigUntil > 0) { reloadTimer.Stop(); reloadTimer.Start(); } };
             watcher.Changed += onChange;
@@ -1313,10 +1582,15 @@ namespace ObsHud
         void Toast(Glyph glyph, Color accent, string title, string detail, string sound, double seconds = 0)
         {
             sounds.Play(sound);
-            var bmp = Gfx.Toast(glyph, accent, title, detail, connected ? scene : null, S);
+            string tag = connected ? scene : null;
+            var bmp = Gfx.Toast(glyph, accent, title, detail, tag, S);
             int offset = pillWin.IsShown ? pillWin.ContentSize.Height + (int)(8 * S) : 0;
             Point pos = Place(bmp.Size, TargetArea(), offset);
             toasts.Show(bmp, pos, (int)((seconds > 0 ? seconds : cfg.ToastSeconds) * 1000));
+            rtssToast = () => Gfx.Toast(glyph, accent, title, detail, tag, S);
+            toastPos = pos;
+            toastSerial++;
+            UpdateRtss();
         }
 
         void Peek()
@@ -1336,6 +1610,8 @@ namespace ObsHud
                 pillWin.Conceal();
                 pillTimer.Stop();
                 pillKey = null;
+                pillShown = null;
+                UpdateRtss();
                 return;
             }
             var key = new StringBuilder();
@@ -1347,11 +1623,115 @@ namespace ObsHud
                 pillKey = key.ToString();
             }
             Point pos = Place(pillWin.ContentSize, TargetArea(), 0);
-            if (redraw || pos != pillPos || !pillWin.IsShown) pillWin.Present(pos, 240);
+            if (redraw || pos != pillPos || !pillWin.IsShown) pillWin.Present(pos, PillAlpha);
             else pillWin.RaiseToTop();
             pillPos = pos;
+            pillShown = parts;
             if (!pillTimer.Enabled) pillTimer.Start();
+            UpdateRtss();
         }
+
+        // No window can show over a game in exclusive fullscreen, so there (with Rtss=1) RTSS draws the
+        // HUD instead, from a copy of what the windows show. Borderless games still show the windows, so
+        // RTSS is left alone there. RTSS's own show/hide switch (which Afterburner's overlay hotkey flips)
+        // hides it with everything else RTSS draws. RTSS announces nothing, so this rereads its shared
+        // memory on every pill tick and toast. Without RTSS it finds no shared memory and does nothing.
+        void UpdateRtss()
+        {
+            string state = "off";
+            if (cfg.Rtss && (pillShown != null || rtssToast != null) && ExclusiveFullscreen())
+            {
+                int pid, zoom;
+                Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out pid);
+                if (!rtss.Target(pid, out zoom)) state = "RTSS isn't running or isn't drawing in this game";
+                else
+                {
+                    string key = pillKey + "|" + pillPos + "|" + (rtssToast != null ? toastSerial : -1) + "|" + zoom + "|" + cfg.Position;
+                    try
+                    {
+                        if (key != rtssKey) { rtssText = RtssImage(zoom); rtssKey = key; }
+                        state = rtss.Show(rtssText) ? "drawing the HUD through RTSS" : "all of RTSS's OSD slots are taken";
+                    }
+                    catch (Exception ex) { state = "couldn't save the HUD picture for RTSS: " + ex.Message; }
+                }
+            }
+            if (state != "drawing the HUD through RTSS") { rtss.Clear(); rtssKey = null; }
+            if (state != rtssState && state != "off") Log.Write("rtss: " + state);
+            rtssState = state;
+        }
+
+        static bool ExclusiveFullscreen()
+        {
+            int state;
+            return Native.SHQueryUserNotificationState(out state) == 0 && state == Native.QUNS_RUNNING_D3D_FULL_SCREEN;
+        }
+
+        static string RtssDir { get { return Path.Combine(Path.GetTempPath(), "obs-hud"); } }
+
+        // Copies what the overlay windows show into one picture: the same pill and toast bitmaps, at the
+        // windows' own screen spots and opacity, so RTSS shows the HUD exactly as the windows would. The
+        // picture runs from the HUD's screen corner to the far side of the HUD, so pinned to that corner
+        // everything lands where the windows are. It's padded to whole zoomed pixels, which RTSS sizes
+        // images in, and each picture gets a new file name so RTSS loads it again.
+        string RtssImage(int zoom)
+        {
+            var shown = new List<Tuple<Bitmap, Point, byte>>();
+            try
+            {
+                if (pillShown != null) shown.Add(Tuple.Create(Gfx.Pill(pillShown, S), pillPos, PillAlpha));
+                if (rtssToast != null) shown.Add(Tuple.Create(rtssToast(), toastPos, (byte)255));
+                return RtssImage(zoom, shown);
+            }
+            finally { foreach (var s in shown) s.Item1.Dispose(); }
+        }
+
+        string RtssImage(int zoom, List<Tuple<Bitmap, Point, byte>> shown)
+        {
+            Rectangle box = Rectangle.Empty;
+            foreach (var s in shown)
+            {
+                var r = new Rectangle(s.Item2, s.Item1.Size);
+                box = box.IsEmpty ? r : Rectangle.Union(box, r);
+            }
+
+            string where = cfg.Position;
+            bool bottom = where.StartsWith("Bottom"), left = where.EndsWith("Left"), right = where.EndsWith("Right");
+            Rectangle screen = Screen.PrimaryScreen.Bounds;
+            int x0 = left ? screen.Left : box.Left, x1 = right ? screen.Right : box.Right;
+            int y0 = bottom ? box.Top : screen.Top, y1 = bottom ? screen.Bottom : box.Bottom;
+            int w = (x1 - x0 + zoom - 1) / zoom * zoom, h = (y1 - y0 + zoom - 1) / zoom * zoom;
+            if (!left) x0 = x1 - w;   // grow away from the pinned corner
+            if (bottom) y0 = y1 - h;
+
+            string file = Path.Combine(RtssDir, "rtss-" + ++rtssImageSerial + ".png");
+            using (var img = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+            {
+                using (var g = Graphics.FromImage(img))
+                {
+                    g.CompositingMode = CompositingMode.SourceCopy;
+                    foreach (var s in shown)
+                        using (var fade = new ImageAttributes())
+                        {
+                            fade.SetColorMatrix(new ColorMatrix { Matrix33 = s.Item3 / 255f });
+                            var dst = new Rectangle(s.Item2.X - x0, s.Item2.Y - y0, s.Item1.Width, s.Item1.Height);
+                            g.DrawImage(s.Item1, dst, 0, 0, dst.Width, dst.Height, GraphicsUnit.Pixel, fade);
+                        }
+                }
+                Directory.CreateDirectory(RtssDir);
+                img.Save(file, ImageFormat.Png);
+            }
+            try { File.Delete(Path.Combine(RtssDir, "rtss-" + (rtssImageSerial - 2) + ".png")); }   // RTSS may still be reading the last one
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+
+            // <LI> loads the picture, <Pn> pins its own layer <L> to one of 9 screen spots (numbered left to right,
+            // top to bottom), and <I> draws all of it. White is set so RTSS doesn't tint it with its text color.
+            int spot = (bottom ? 6 : 0) + (left ? 0 : right ? 2 : 1);
+            return string.Format("<LI=\"{0}\"><P{1}><L{2}><C=FFFFFF><I={3},{4},0,0,{5},{6}><C>",
+                file, spot, RtssLayer, w / zoom, h / zoom, w, h);
+        }
+
+        const int RtssLayer = 32;   // high enough to stay clear of overlay layouts, which number layers from 0
 
         List<KeyValuePair<Color, string>> CurrentPillParts()
         {
@@ -1431,6 +1811,7 @@ namespace ObsHud
             items.Clear();
             var head = new ToolStripMenuItem(StatusLine()) { Enabled = false };
             items.Add(head);
+            if (updateReady != null) Item(items, "Restart to update to " + updateReady.Tag, true, RestartToUpdate);
             items.Add(new ToolStripSeparator());
             Item(items, "Save replay", connected && replay, delegate { Do("SaveReplayBuffer", "Couldn't save the clip"); });
             Item(items, replay ? "Stop replay buffer" : "Start replay buffer", connected, delegate { Do("ToggleReplayBuffer", "Replay buffer"); });
@@ -1442,6 +1823,9 @@ namespace ObsHud
             items.Add(new ToolStripSeparator());
             Toggle(items, "Status pill while active", cfg.Pill, delegate { cfg.Pill = !cfg.Pill; SaveConfig(); RefreshPill(); });
             Toggle(items, "Sounds", cfg.Sounds, delegate { cfg.Sounds = !cfg.Sounds; SaveConfig(); });
+            Toggle(items, "Draw through RTSS in exclusive fullscreen", cfg.Rtss, delegate { cfg.Rtss = !cfg.Rtss; SaveConfig(); RefreshPill(); });
+            Toggle(items, "Update automatically", cfg.AutoUpdate, delegate { cfg.AutoUpdate = !cfg.AutoUpdate; SaveConfig(); ScheduleUpdates(); });
+            Item(items, checkingUpdates ? "Checking for updates…" : "Check for updates (v" + VersionText(Updater.Current) + ")", !checkingUpdates && updateReady == null, delegate { CheckForUpdates(true); });
             var position = new ToolStripMenuItem("Position");
             foreach (var p in Config.Positions)
             {
@@ -1521,9 +1905,59 @@ namespace ObsHud
             string hotkeyError = hotkey.Register(cfg.PeekHotkey);
             pillKey = null;
             RefreshPill();
+            ScheduleUpdates();
             Log.Write("settings reloaded");
             if (hotkeyError != null) Toast(Glyph.Warn, Gfx.Amber, "Status hotkey not set", hotkeyError, "warn");
             else Toast(Glyph.Info, Gfx.Gray, "Settings reloaded", null, null);
+        }
+
+        // With AutoUpdate, checks a minute after starting (to stay out of the way of startup), then twice a day.
+        void ScheduleUpdates()
+        {
+            updateTimer.Stop();
+            if (!cfg.AutoUpdate) return;
+            updateTimer.Interval = 60 * 1000;
+            updateTimer.Start();
+        }
+
+        // Looks for a newer release and installs it. A found update is always announced, and the menu
+        // offers the restart; "up to date" and errors are only shown for a check asked for from the menu.
+        // It never restarts on its own or pops up a window, so it can't interrupt a game.
+        async void CheckForUpdates(bool asked)
+        {
+            if (checkingUpdates || updateReady != null) return;
+            checkingUpdates = true;
+            try
+            {
+                var release = await Updater.Newer();
+                if (release == null)
+                {
+                    if (asked) Toast(Glyph.Check, Gfx.Green, "OBS HUD is up to date", "Version " + VersionText(Updater.Current), null);
+                    return;
+                }
+                await Updater.Install(release, Application.ExecutablePath);
+                updateReady = release;
+                Log.Write("update: installed " + release.Tag + ", runs after a restart");
+                Toast(Glyph.Info, Gfx.Teal, "OBS HUD " + release.Tag + " is ready", "Restart it from the tray icon to start using it", null, 6);
+            }
+            catch (Exception ex)
+            {
+                Log.Write("update: " + ex.Message);
+                if (asked) Toast(Glyph.Warn, Gfx.Amber, "Couldn't update OBS HUD", ex.Message, "warn");
+            }
+            finally { checkingUpdates = false; }
+        }
+
+        void RestartToUpdate()
+        {
+            Log.Write("update: restarting into " + updateReady.Tag);
+            Process.Start(Application.ExecutablePath, "--restart");
+            ExitThread();
+        }
+
+        static string VersionText(Version v)
+        {
+            return v.ToString(v.Build > 0 ? 3 : 2);
         }
 
         // Plays every toast and sound once, with a fake pill, without touching OBS.
@@ -1575,6 +2009,10 @@ namespace ObsHud
             hotkey.Dispose();
             toastWin.Dispose();
             pillWin.Dispose();
+            rtss.Clear();
+            try { Directory.Delete(RtssDir, true); }
+            catch (IOException) { }   // includes the folder never having been made
+            catch (UnauthorizedAccessException) { }
             Log.Write("exit");
             base.ExitThreadCore();
         }
